@@ -12,12 +12,12 @@ LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
 ## Launch the teacher model server in the background
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
-    --model-path /root/Qwen3-32B \
+    --model-path /opt/tiger/models/Qwen3-32B \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
     --tp 1 \
     --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.6 \
+    --mem-fraction-static 0.9 \
     > "$LOG_FILE" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -44,19 +44,19 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime/scripts/models/qwen3-8B.sh"
+source "/opt/tiger/my-research/rl/slime/scripts/models/qwen3-8B.sh"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-8B
-   --ref-load /root/Qwen3-8B_torch_dist
-   --load /root/Qwen3-8B_slime/
-   --save /root/Qwen3-8B_slime/
+   --hf-checkpoint /opt/tiger/models/Qwen3-8B
+   --ref-load /opt/tiger/models/Qwen3-8B_torch_dist
+   --load /opt/tiger/models/Qwen3-8B_slime/
+   --save /opt/tiger/models/Qwen3-8B_slime/
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /opt/tiger/datasets/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --apply-chat-template
    --rollout-shuffle
@@ -153,7 +153,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
      "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM/",
+        "PYTHONPATH": "/opt/tiger/my-research/rl/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1"
      }
    }' \
