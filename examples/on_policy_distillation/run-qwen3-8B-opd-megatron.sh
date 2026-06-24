@@ -21,19 +21,19 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime/scripts/models/qwen3-8B.sh"
+source "/opt/tiger/my-research/rl/slime/scripts/models/qwen3-8B.sh"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-8B
-   --ref-load /root/Qwen3-8B_torch_dist
-   --load /root/Qwen3-8B_slime/
-   --save /root/Qwen3-8B_slime/
+   --hf-checkpoint /opt/tiger/models/Qwen3-8B
+   --ref-load /opt/tiger/models/Qwen3-8B_torch_dist
+   --load /opt/tiger/models/Qwen3-8B_slime/
+   --save /opt/tiger/models/Qwen3-8B_slime/
    --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /opt/tiger/datasets/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --apply-chat-template
    --rollout-shuffle
@@ -84,7 +84,7 @@ GRPO_ARGS=(
    --opd-type megatron                                # Use Megatron forward for teacher
    --opd-kl-coef 1.0                                  # CHANGE THIS: KL penalty coefficient
    # Teacher model configuration (CHANGE THIS to a stronger model!)
-   --opd-teacher-load /root/Qwen3-8B_torch_dist      # Teacher model path
+   --opd-teacher-load /opt/tiger/models/Qwen3-8B_torch_dist      # Teacher model path
    
    --use-kl-loss
    --kl-loss-coef 0.00
@@ -133,7 +133,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
      "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM/",
+        "PYTHONPATH": "/opt/tiger/my-research/rl/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1"
      }
    }' \

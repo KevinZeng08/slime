@@ -4,6 +4,15 @@
 
 set -ex
 
+# All traffic in this job is local (localhost teacher + this node's rollout
+# engines). Drop any corporate HTTP proxy so in-process health checks don't get
+# routed through it: slime's _wait_server_healthy uses Python `requests`, which
+# (unlike curl) does NOT honor CIDR `no_proxy` entries, so engine health probes
+# to the node's global IPv6 address would otherwise hang forever on the proxy.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export no_proxy="*"
+export NO_PROXY="*"
+
 
 # Start the teacher model server
 TEACHER_IP="127.0.0.1" # Use localhost here, you can change it to your IP
