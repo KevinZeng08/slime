@@ -4,14 +4,33 @@
 
 set -ex
 
-# All traffic in this job is local (localhost teacher + this node's rollout
-# engines). Drop any corporate HTTP proxy so in-process health checks don't get
-# routed through it: slime's _wait_server_healthy uses Python `requests`, which
-# (unlike curl) does NOT honor CIDR `no_proxy` entries, so engine health probes
-# to the node's global IPv6 address would otherwise hang forever on the proxy.
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-export no_proxy="*"
-export NO_PROXY="*"
+# Proxy handling: we KEEP the corporate HTTP proxy so external services (e.g.
+# online wandb at api.wandb.ai) remain reachable, but we must ensure all LOCAL
+# traffic (localhost teacher + this node's rollout engines on the node's global
+# IP) bypasses the proxy. slime's _wait_server_healthy uses Python `requests`,
+# which does NOT honor CIDR `no_proxy` entries (unlike curl) but DOES honor exact
+# IP / hostname entries. So we add this node's concrete IPv4/IPv6 addresses to
+# no_proxy. Otherwise local IPv6 health probes hang forever on the proxy.
+NODE_IPS=$(python3 -c "
+import socket
+ips=set()
+host=socket.gethostname()
+for fam in (socket.AF_INET, socket.AF_INET6):
+    try:
+        for info in socket.getaddrinfo(host, None, family=fam):
+            ips.add(info[4][0].split('%')[0])
+    except Exception:
+        pass
+for fam, target in ((socket.AF_INET,'8.8.8.8'), (socket.AF_INET6,'2001:4860:4860::8888')):
+    try:
+        s=socket.socket(fam, socket.SOCK_DGRAM); s.connect((target,80)); ips.add(s.getsockname()[0].split('%')[0]); s.close()
+    except Exception:
+        pass
+print(','.join(sorted(ips)))
+")
+export no_proxy="localhost,127.0.0.1,::1,${NODE_IPS}${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+echo "no_proxy=$no_proxy"
 
 
 # Start the teacher model server
@@ -20,13 +39,20 @@ TEACHER_PORT=13141
 LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
 ## Launch the teacher model server in the background
-CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
+# NOTE: The teacher only does prefill + logprob scoring (max_new_tokens=0) over
+# full sequences (prompt + up to 16k response tokens). The logits/logprob gather
+# is a large transient allocation. Serving Qwen3-32B with TP=2 across GPUs 6,7
+# splits the ~62GB of weights to ~31GB/GPU, leaving plenty of headroom for that
+# transient logits memory (a single GPU at mem-fraction-static 0.9 hit CUDA OOM
+# in logits_processor). Ray training is restricted to GPUs 0-5 below to avoid
+# colliding with the teacher.
+CUDA_VISIBLE_DEVICES=6,7 python3 -m sglang.launch_server \
     --model-path /opt/tiger/models/Qwen3-32B \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
-    --tp 1 \
+    --tp 2 \
     --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.9 \
+    --mem-fraction-static 0.85 \
     > "$LOG_FILE" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -107,7 +133,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 16384
+   --max-tokens-per-gpu 8192 # reduce from 16K to 8K to avoid OOM
 )
 
 GRPO_ARGS=(
@@ -131,10 +157,11 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-8B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-opd
+   --wandb-group qwen3-8B-opd
+   # Already logged in via `wandb login`, so no --wandb-key needed.
+   # --wandb-team your-team   # set if your runs live under a team/entity
 )
 
 SGLANG_ARGS=(
@@ -155,8 +182,10 @@ MISC_ARGS=(
 
 
 # launch the master node of ray in container
+# Teacher occupies GPUs 6,7 (TP=2), so restrict Ray to GPUs 0-5 (actor 2 +
+# rollout 4 = 6 GPUs) to avoid colliding with the teacher server.
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 ray job submit --address="http://127.0.0.1:8265" \
@@ -189,7 +218,5 @@ pkill -9 sglang
 sleep 3
 ray stop --force
 pkill -9 ray
-pkill -9 python
 sleep 3
 pkill -9 ray
-pkill -9 python
