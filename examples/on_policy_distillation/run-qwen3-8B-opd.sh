@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=6,7 python3 -m sglang.launch_server \
     --port $TEACHER_PORT \
     --tp 2 \
     --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.7 \
     > "$LOG_FILE" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -88,6 +88,13 @@ CKPT_ARGS=(
    --load /opt/tiger/models/Qwen3-8B_slime/
    --save /opt/tiger/models/Qwen3-8B_slime/
    --save-interval 20
+   # Only persist the bf16 model weights (~16GB); skip the fp32 optimizer state
+   # (master weights + Adam m/v, ~91GB). Resuming from these ckpts therefore
+   # cannot restore a warm optimizer, so also skip loading it on resume.
+   --no-save-optim
+   --no-save-rng
+   --no-load-optim
+   --no-load-rng
 )
 
 ROLLOUT_ARGS=(
@@ -133,7 +140,8 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192 # reduce from 16K to 8K to avoid OOM
+   --max-tokens-per-gpu 16384 # same as max rollout response length
+   --log-probs-chunk-size 1024 # avoid OOM
 )
 
 GRPO_ARGS=(
@@ -154,6 +162,15 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
+   # Offload optimizer state (fp32 master params + Adam m/v) to CPU to free
+   # ~tens of GB of GPU memory, leaving headroom for the fp32 logits spike in
+   # the log-prob forward. Requires --use-precision-aware-optimizer (Megatron
+   # reuses that code path for the hybrid device optimizer).
+   --optimizer-cpu-offload
+   --use-precision-aware-optimizer
+   --optimizer-offload-fraction 1.0
+   --overlap-cpu-optimizer-d2h-h2d
 )
 
 WANDB_ARGS=(
