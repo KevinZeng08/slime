@@ -1,0 +1,239 @@
+#!/bin/bash
+
+# usage: bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
+
+set -ex
+
+# Proxy handling: we KEEP the corporate HTTP proxy so external services (e.g.
+# online wandb at api.wandb.ai) remain reachable, but we must ensure all LOCAL
+# traffic (localhost teacher + this node's rollout engines on the node's global
+# IP) bypasses the proxy. slime's _wait_server_healthy uses Python `requests`,
+# which does NOT honor CIDR `no_proxy` entries (unlike curl) but DOES honor exact
+# IP / hostname entries. So we add this node's concrete IPv4/IPv6 addresses to
+# no_proxy. Otherwise local IPv6 health probes hang forever on the proxy.
+NODE_IPS=$(python3 -c "
+import socket
+ips=set()
+host=socket.gethostname()
+for fam in (socket.AF_INET, socket.AF_INET6):
+    try:
+        for info in socket.getaddrinfo(host, None, family=fam):
+            ips.add(info[4][0].split('%')[0])
+    except Exception:
+        pass
+for fam, target in ((socket.AF_INET,'8.8.8.8'), (socket.AF_INET6,'2001:4860:4860::8888')):
+    try:
+        s=socket.socket(fam, socket.SOCK_DGRAM); s.connect((target,80)); ips.add(s.getsockname()[0].split('%')[0]); s.close()
+    except Exception:
+        pass
+print(','.join(sorted(ips)))
+")
+export no_proxy="localhost,127.0.0.1,::1,${NODE_IPS}${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+echo "no_proxy=$no_proxy"
+
+
+# Start the teacher model server
+TEACHER_IP="127.0.0.1" # Use localhost here, you can change it to your IP
+TEACHER_PORT=13141
+LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
+
+## Launch the teacher model server in the background
+# NOTE: The teacher only does prefill + logprob scoring (max_new_tokens=0) over
+# full sequences (prompt + up to 16k response tokens). The logits/logprob gather
+# is a large transient allocation. Serving Qwen3-32B with TP=2 across GPUs 6,7
+# splits the ~62GB of weights to ~31GB/GPU, leaving plenty of headroom for that
+# transient logits memory (a single GPU at mem-fraction-static 0.9 hit CUDA OOM
+# in logits_processor). Ray training is restricted to GPUs 0-5 below to avoid
+# colliding with the teacher.
+CUDA_VISIBLE_DEVICES=3 python3 -m sglang.launch_server \
+    --model-path /opt/tiger/models/Qwen3-32B \
+    --host 0.0.0.0 \
+    --port $TEACHER_PORT \
+    --tp 1 \
+    --chunked-prefill-size 4096 \
+    --mem-fraction-static 0.7 \
+    > "$LOG_FILE" 2>&1 &
+
+echo "Starting teacher model server..."
+
+## Wait for the teacher model server to be ready
+until curl -sf http://$TEACHER_IP:$TEACHER_PORT/health_generate > /dev/null; do
+    echo "Waiting for the teacher model server to start..."
+    tail -n 10 "$LOG_FILE"
+    sleep 5
+done
+
+curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
+echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
+sleep 10
+
+
+export PYTHONUNBUFFERED=1
+
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ "$NVLINK_COUNT" -gt 0 ]; then
+    HAS_NVLINK=1
+else
+    HAS_NVLINK=0
+fi
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+
+source "/opt/tiger/my-research/rl/slime/scripts/models/qwen3-8B.sh"
+
+
+CKPT_ARGS=(
+   --hf-checkpoint /opt/tiger/models/Qwen3-8B
+   --ref-load /opt/tiger/models/Qwen3-8B_torch_dist
+   --load /opt/tiger/models/Qwen3-8B_slime/
+   --save /opt/tiger/models/Qwen3-8B_slime/
+   --save-interval 20
+   # Only persist the bf16 model weights (~16GB); skip the fp32 optimizer state
+   # (master weights + Adam m/v, ~91GB). Resuming from these ckpts therefore
+   # cannot restore a warm optimizer, so also skip loading it on resume.
+   --no-save-optim
+   --no-save-rng
+   --no-load-optim
+   --no-load-rng
+)
+
+ROLLOUT_ARGS=(
+   --prompt-data /opt/tiger/datasets/dapo-math-17k/dapo-math-17k.jsonl
+   --input-key prompt
+   --apply-chat-template
+   --rollout-shuffle
+   --num-rollout 100
+   --rollout-batch-size 16
+   --n-samples-per-prompt 4
+   --rollout-max-response-len 16384
+   --rollout-temperature 1
+
+   --global-batch-size 64
+   --balance-data
+)
+
+RM_ARGS=(
+   --custom-rm-path slime.rollout.on_policy_distillation.reward_func
+   --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
+   --rm-url http://$TEACHER_IP:$TEACHER_PORT/generate
+)
+
+EVAL_ARGS=(
+   # --eval-interval 20
+   # --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
+   # --n-samples-per-eval-prompt 16
+   # --eval-max-response-len 16384
+   # --eval-top-p 1
+)
+
+PERF_ARGS=(
+   --tensor-model-parallel-size 1
+   --sequence-parallel
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --expert-tensor-parallel-size 1
+
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
+
+   # --micro-batch-size 1
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 16384 # same as max rollout response length
+   --log-probs-chunk-size 1024 # avoid OOM
+)
+
+GRPO_ARGS=(
+   --advantage-estimator grpo
+   --use-opd
+   --opd-type sglang
+   --opd-kl-coef 1.0
+   --use-kl-loss
+   --kl-loss-coef 0.00
+   --kl-loss-type low_var_kl
+   --entropy-coef 0.00
+)
+
+OPTIMIZER_ARGS=(
+   --optimizer adam
+   --lr 1e-6
+   --lr-decay-style constant
+   --weight-decay 0.1
+   --adam-beta1 0.9
+   --adam-beta2 0.98
+
+   # Offload optimizer state (fp32 master params + Adam m/v) to CPU to free
+   # ~tens of GB of GPU memory, leaving headroom for the fp32 logits spike in
+   # the log-prob forward. Requires --use-precision-aware-optimizer (Megatron
+   # reuses that code path for the hybrid device optimizer).
+   --optimizer-cpu-offload
+   --use-precision-aware-optimizer
+   --optimizer-offload-fraction 1.0
+   --overlap-cpu-optimizer-d2h-h2d
+)
+
+WANDB_ARGS=(
+   --use-wandb
+   --wandb-project slime-opd
+   --wandb-group qwen3-8B-opd-gb200
+   # Already logged in via `wandb login`, so no --wandb-key needed.
+   # --wandb-team your-team   # set if your runs live under a team/entity
+)
+
+SGLANG_ARGS=(
+   --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.4
+)
+
+
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --attention-backend flash
+)
+
+
+
+
+# launch the master node of ray in container
+# Teacher occupies GPUs 6,7 (TP=2), so restrict Ray to GPUs 0-5 (actor 2 +
+# rollout 4 = 6 GPUs) to avoid colliding with the teacher server.
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+CUDA_VISIBLE_DEVICES=0,1,2 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+
+
+ray job submit --address="http://127.0.0.1:8265" \
+   --runtime-env-json='{
+     "env_vars": {
+        "PYTHONPATH": "/opt/tiger/my-research/rl/Megatron-LM/",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+     }
+   }' \
+   -- python3 train.py \
+   --actor-num-nodes 1 \
+   --actor-num-gpus-per-node 1 \
+   --rollout-num-gpus 2 \
+   ${MODEL_ARGS[@]} \
+   ${CKPT_ARGS[@]} \
+   ${ROLLOUT_ARGS[@]} \
+   ${OPTIMIZER_ARGS[@]} \
+   ${GRPO_ARGS[@]} \
+   ${WANDB_ARGS[@]} \
+   ${PERF_ARGS[@]} \
+   ${EVAL_ARGS[@]} \
+   ${SGLANG_ARGS[@]} \
+   ${MISC_ARGS[@]} \
+   ${RM_ARGS[@]}
+
+
+
+####clear after training
+pkill -9 sglang
+sleep 3
+ray stop --force
+pkill -9 ray
+sleep 3
+pkill -9 ray

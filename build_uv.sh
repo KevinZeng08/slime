@@ -101,7 +101,15 @@ git fetch --tags --quiet || true
 git checkout "${SGLANG_VERSION}"
 
 # Install sglang (python[all]) but keep torch from being downgraded off cu130.
-uvpip -e "python[all]" --extra-index-url "$TORCH_INDEX"
+#
+# --index-strategy unsafe-best-match is required on GB200 / aarch64 (ARM) hosts:
+# sglang pins torchao==0.17.0, but the pytorch cu130 index only ships
+# torchao==0.17.0+cu130 with no aarch64 wheel. uv's default first-index-match
+# locks torchao to the pytorch index and never falls back to PyPI's plain
+# 0.17.0 (which does have an aarch64 wheel), so resolution fails. unsafe-best-match
+# lets uv consider PyPI too. torch keeps its cu130 build (the +cu130 local version
+# sorts above plain 2.11.0) and is re-pinned below regardless.
+uvpip -e "python[all]" --extra-index-url "$TORCH_INDEX" --index-strategy unsafe-best-match
 
 # Re-pin torch (sglang may have pulled a default-channel build).
 #
@@ -226,10 +234,31 @@ uvpip . --no-build-isolation
 # numpy 1.x for megatron; kernels<0.15 so `import sglang` works at runtime.
 uvpip "numpy<2"
 uvpip "kernels<0.15.0"
+# scipy 1.16+ requires numpy>=2.0 and uses np.long (removed in numpy 1.24, only
+# re-added in 2.0), so it crashes at import against the numpy<2 pin above. Hold
+# scipy on the last 1.15.x line, which still supports numpy 1.x.
+uvpip "scipy<1.16"
 
-# slime-flavored sglang router.
-uvpip --force-reinstall \
-  https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-1117d05/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl
+# slime-flavored sglang router. The prebuilt wheel is published for x86_64 only
+# (both the zhuzilin/sgl-router fork and upstream sglang-router on PyPI ship no
+# aarch64 wheel), so on GB200 / aarch64 we build the Rust extension from source.
+# Its version.py reports "0.3.2+slime", so a source build still satisfies the
+# assert below. maturin (the build backend) is pulled in during build isolation
+# and uses the rust toolchain set up in Preflight.
+SGL_ROUTER_TAG="v0.3.2-1117d05"
+if [ "$(uname -m)" = "x86_64" ]; then
+  uvpip --force-reinstall \
+    "https://github.com/zhuzilin/sgl-router/releases/download/${SGL_ROUTER_TAG}/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl"
+else
+  if [ ! -d "$BASE_DIR/sgl-router" ]; then
+    git clone https://github.com/zhuzilin/sgl-router.git "$BASE_DIR/sgl-router"
+  fi
+  cd "$BASE_DIR/sgl-router"
+  git fetch --tags --quiet || true
+  git checkout "$SGL_ROUTER_TAG"
+  uvpip --force-reinstall ./bindings/python
+  cd "$SLIME_DIR"
+fi
 "$PYTHON" -c "import sglang_router; assert 'slime' in sglang_router.__version__"
 
 # ======================================== Patches =============================================
