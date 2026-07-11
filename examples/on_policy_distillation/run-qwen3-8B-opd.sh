@@ -46,13 +46,14 @@ LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 # transient logits memory (a single GPU at mem-fraction-static 0.9 hit CUDA OOM
 # in logits_processor). Ray training is restricted to GPUs 0-5 below to avoid
 # colliding with the teacher.
-CUDA_VISIBLE_DEVICES=6,7 python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server \
     --model-path /opt/tiger/models/Qwen3-32B \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
-    --tp 2 \
-    --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.7 \
+    --tp 1 \
+    --chunked-prefill-size -1 \
+    --mem-fraction-static 0.6 \
+    --cpu-offload-gb 60 \
     > "$LOG_FILE" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -102,13 +103,13 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 300
-   --rollout-batch-size 16
+   --num-rollout 10
+   --rollout-batch-size 20
    --n-samples-per-prompt 4
    --rollout-max-response-len 16384
    --rollout-temperature 1
 
-   --global-batch-size 64
+   --global-batch-size 80
    --balance-data
 )
 
@@ -215,7 +216,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 4 \
+   --rollout-num-gpus 5 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
