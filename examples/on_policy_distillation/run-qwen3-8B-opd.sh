@@ -203,7 +203,7 @@ MISC_ARGS=(
 # Teacher occupies GPUs 6,7 (TP=2), so restrict Ray to GPUs 0-5 (actor 2 +
 # rollout 4 = 6 GPUs) to avoid colliding with the teacher server.
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 7 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 ray job submit --address="http://127.0.0.1:8265" \
