@@ -49,7 +49,10 @@ LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 # transient logits memory (a single GPU at mem-fraction-static 0.9 hit CUDA OOM
 # in logits_processor). Ray rollout is restricted to GPUs 0-5 below to avoid
 # colliding with the teacher.
-CUDA_VISIBLE_DEVICES=6,7 python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=6,7 \
+SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=true \
+SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=2048 \
+python3 -m sglang.launch_server \
     --model-path /opt/tiger/models/Qwen3-32B \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
